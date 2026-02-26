@@ -16,6 +16,8 @@ const swaggerSpec = require("./config/swagger");
 
 const priceRoutes = require("./routes/prices");
 const transactionRoutes = require("./routes/transactions");
+const onrampRoutes = require("./routes/onramp");   // ← NEW
+const offrampRoutes = require("./routes/offramp"); // ← NEW
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -91,6 +93,8 @@ app.get("/api-docs.json", (req, res) => {
 // ── API Routes ──────────────────────────────────────────────────
 app.use("/api/prices", priceRoutes);
 app.use("/api/transactions", transactionRoutes);
+app.use("/api/onramp", onrampRoutes);   // ← NEW
+app.use("/api/offramp", offrampRoutes); // ← NEW
 
 // ── 404 & Error Handlers ────────────────────────────────────────
 app.use(notFound);
