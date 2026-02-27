@@ -1,7 +1,4 @@
 // ============= routes/offramp.js =============
-// UPDATED: confirm-receipt is now called only by the server-side Stacks
-// indexer (services/stacksIndexer.js), never from the browser.
-// The NEXT_PUBLIC_INTERNAL_KEY env var has been removed from the frontend.
 
 const express = require("express");
 const router  = express.Router();
@@ -10,6 +7,7 @@ const {
   getOfframpRate,
   verifyAccount,
   initializeOfframp,
+  notifyTxBroadcast,        // ← ADDED: triggers background poll after wallet signs
   confirmTokenReceipt,
   handleLencoWebhook,
   getOfframpStatus,
@@ -152,11 +150,6 @@ router.post("/verify-account", verifyAccount);
  *       transaction, and returns a deposit address + memo.
  *       The user must then send exactly `tokenAmount` of `token` to `depositInstructions.sendTo`
  *       with `transactionReference` as the memo/note within 30 minutes.
- *
- *       After the user signs the wallet transaction, the server-side Stacks indexer
- *       (stacksIndexer.js) detects the on-chain transfer and automatically calls
- *       confirm-receipt to trigger the NGN payout. The frontend does NOT call
- *       confirm-receipt directly.
  *     requestBody:
  *       required: true
  *       content:
@@ -174,7 +167,6 @@ router.post("/verify-account", verifyAccount);
  *                 example: 100
  *               stacksAddress:
  *                 type: string
- *                 description: Sender's Stacks wallet address (used for refunds if needed)
  *                 example: SP3EWE151DHDTV7CP5D7N2YYESA3VEH3TBPNTT4EV
  *               bankCode:
  *                 type: string
@@ -184,19 +176,66 @@ router.post("/verify-account", verifyAccount);
  *                 example: "7043314162"
  *               accountName:
  *                 type: string
- *                 description: Optional — used as fallback if Lenco resolve doesn't return it
  *                 example: "John Doe"
  *     responses:
  *       201:
- *         description: |
- *           Transaction created. Send tokenAmount to depositInstructions.sendTo
- *           with transactionReference as memo. NGN paid to bank after on-chain confirmation.
+ *         description: Transaction created. Send tokens to deposit address with reference as memo.
  *       400:
  *         description: Validation or bank verification error
  *       503:
  *         description: Deposit address not configured
  */
 router.post("/initialize", initializeOfframp);
+
+/**
+ * @swagger
+ * /api/offramp/notify-tx:
+ *   post:
+ *     summary: Notify backend that wallet has signed and broadcast the Stacks TX
+ *     tags: [Offramp]
+ *     description: |
+ *       Called by the frontend immediately after the user approves the transaction
+ *       in their wallet (Leather/Xverse) and onFinish fires with a txId.
+ *       Saves the Stacks TX ID to the database and starts a background poll loop
+ *       that watches the Stacks blockchain for confirmation, then triggers the
+ *       Lenco NGN bank payout automatically once the TX is confirmed on-chain.
+ *
+ *       This endpoint responds immediately (fire-and-forget polling in background).
+ *       The frontend does not need to wait for settlement — it just needs to call
+ *       this once so the backend knows which TX to watch.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [transactionReference, stacksTxId]
+ *             properties:
+ *               transactionReference:
+ *                 type: string
+ *                 description: The reference returned by /initialize (e.g. SSWAP_OFFRAMP_...)
+ *                 example: SSWAP_OFFRAMP_MM4PKWOL_1DEEFEA8
+ *               stacksTxId:
+ *                 type: string
+ *                 description: The Stacks transaction ID from the wallet's onFinish callback
+ *                 example: be93a32cf499e79a70edf08edc901c5faf9afdd876975fa2aa55cd92d49
+ *     responses:
+ *       200:
+ *         description: TX received, background polling started
+ *         content:
+ *           application/json:
+ *             example:
+ *               success: true
+ *               message: "TX received. Monitoring confirmation and triggering NGN payout."
+ *               data:
+ *                 transactionReference: SSWAP_OFFRAMP_MM4PKWOL_1DEEFEA8
+ *                 stacksTxId: be93a32cf499e79a70edf08edc901c5faf9afdd876975fa2aa55cd92d49
+ *       400:
+ *         description: Missing transactionReference or stacksTxId
+ *       404:
+ *         description: Transaction not found in database
+ */
+router.post("/notify-tx", notifyTxBroadcast);
 
 /**
  * @swagger
@@ -211,10 +250,7 @@ router.post("/initialize", initializeOfframp);
  *       Triggers the Lenco NGN bank transfer.
  *
  *       SECURITY: Protected by requireInternalKey middleware (x-internal-key header).
- *       This endpoint must NEVER be called from the browser — doing so would:
- *         1. Cause EPROTO SSL errors (browser TLS vs internal endpoint mismatch)
- *         2. Expose the internal key in the client bundle via NEXT_PUBLIC_*
- *       The indexer handles all server-to-server communication securely.
+ *       This endpoint must NEVER be called from the browser.
  *     security:
  *       - InternalApiKey: []
  *     requestBody:
@@ -230,7 +266,6 @@ router.post("/initialize", initializeOfframp);
  *                 example: SSWAP_OFFRAMP_LKJHG_A1B2C3D4
  *               stacksTxId:
  *                 type: string
- *                 description: On-chain Stacks transaction ID
  *               tokenAmount:
  *                 type: number
  *               token:
@@ -243,7 +278,7 @@ router.post("/initialize", initializeOfframp);
  *       401:
  *         description: Unauthorized — missing or invalid x-internal-key
  *       404:
- *         description: Transaction not found (indexer will retry on next poll)
+ *         description: Transaction not found
  *       500:
  *         description: Lenco transfer failed — manual action required
  */
@@ -272,7 +307,6 @@ router.post("/lenco-webhook", handleLencoWebhook);
  *   get:
  *     summary: Get status of an offramp transaction
  *     tags: [Offramp]
- *     description: Polled by the frontend sell_pending step to track transaction progress.
  *     parameters:
  *       - in: path
  *         name: reference

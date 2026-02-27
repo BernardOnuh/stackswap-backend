@@ -70,6 +70,36 @@ const transactionSchema = new mongoose.Schema(
       type: String,
       maxlength: 120,
     },
+
+    // Payment reference (used for offramp flow)
+    paymentReference: {
+      type: String,
+      trim: true,
+      sparse: true,
+    },
+
+    // Direction: onramp or offramp
+    direction: {
+      type: String,
+      enum: ["onramp", "offramp"],
+    },
+
+    // Fee in token (if any)
+    feeToken: {
+      type: Number,
+      default: 0,
+    },
+
+    // Confirmed timestamp
+    confirmedAt: {
+      type: Date,
+    },
+
+    // Flexible metadata (bank details, Lenco info, etc.)
+    meta: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
   },
   { timestamps: true }
 );
@@ -78,5 +108,7 @@ const transactionSchema = new mongoose.Schema(
 transactionSchema.index({ senderAddress: 1, createdAt: -1 });
 transactionSchema.index({ status: 1 });
 transactionSchema.index({ txId: 1 }, { sparse: true });
+transactionSchema.index({ paymentReference: 1 }, { sparse: true });
+transactionSchema.index({ direction: 1, status: 1 });
 
 module.exports = mongoose.model("Transaction", transactionSchema);
