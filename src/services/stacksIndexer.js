@@ -18,7 +18,37 @@
 //     handles missed transactions (e.g. if user closes the tab early)
 
 const axios = require("axios");
-const logger = require("../config/logger");
+
+// ── Console logger with colors + timestamps ──────────────────────────
+// Uses ANSI escape codes — works in any Node.js terminal (PM2, Railway, Render, etc.)
+// Set NO_COLOR=1 in env to disable color if piping to a log file.
+const useColor = !process.env.NO_COLOR;
+const c = {
+  reset:  useColor ? "\x1b[0m"  : "",
+  bold:   useColor ? "\x1b[1m"  : "",
+  dim:    useColor ? "\x1b[2m"  : "",
+  cyan:   useColor ? "\x1b[36m" : "",
+  green:  useColor ? "\x1b[32m" : "",
+  yellow: useColor ? "\x1b[33m" : "",
+  red:    useColor ? "\x1b[31m" : "",
+  blue:   useColor ? "\x1b[34m" : "",
+  orange: useColor ? "\x1b[38;5;208m" : "",
+  gray:   useColor ? "\x1b[90m" : "",
+};
+
+function ts() {
+  return `${c.gray}[${new Date().toISOString()}]${c.reset}`;
+}
+
+const log = {
+  info:    (msg) => console.log(`${ts()} ${c.cyan}${c.bold}[Indexer]${c.reset} ${msg}`),
+  success: (msg) => console.log(`${ts()} ${c.green}${c.bold}[Indexer]${c.reset} ${msg}`),
+  warn:    (msg) => console.warn(`${ts()} ${c.yellow}${c.bold}[Indexer]${c.reset} ${msg}`),
+  error:   (msg) => console.error(`${ts()} ${c.red}${c.bold}[Indexer]${c.reset} ${msg}`),
+  poll:    (msg) => console.log(`${ts()} ${c.gray}[Indexer]${c.reset} ${msg}`),
+  tx:      (msg) => console.log(`${ts()} ${c.orange}${c.bold}[Indexer]${c.reset} ${msg}`),
+  banner:  (msg) => console.log(`\n${c.cyan}${c.bold}${"─".repeat(60)}${c.reset}\n${c.cyan}${c.bold}  ${msg}${c.reset}\n${c.cyan}${c.bold}${"─".repeat(60)}${c.reset}\n`),
+};
 
 // ── Config ──────────────────────────────────────────────────────────
 const STACKS_API_BASE  = process.env.STACKS_API_URL || "https://api.hiro.so";
@@ -35,6 +65,7 @@ const USDC_FULL_ID          = `${USDC_CONTRACT_ADDRESS}.${USDC_CONTRACT_NAME}`;
 // Track already-processed tx IDs in memory to avoid duplicate calls.
 // On restart, confirm-receipt is idempotent so re-processing is safe.
 const processedTxIds = new Set();
+let pollCount = 0;
 
 // ── Memo decoding ────────────────────────────────────────────────────
 /**
@@ -63,24 +94,39 @@ async function checkInboundSTXTransfers() {
     });
 
     const txs = res.data?.results || [];
+    const inbound = txs.filter(
+      (tx) =>
+        tx.tx_status === "success" &&
+        tx.tx_type   === "token_transfer" &&
+        tx.token_transfer?.recipient_address === PLATFORM_ADDRESS
+    );
 
-    for (const tx of txs) {
-      // Only process successful STX token transfers TO our address
-      if (
-        tx.tx_status !== "success" ||
-        tx.tx_type  !== "token_transfer" ||
-        tx.token_transfer?.recipient_address !== PLATFORM_ADDRESS
-      ) continue;
+    log.poll(
+      `STX scan complete — ${c.bold}${txs.length}${c.reset} txs fetched, ` +
+      `${c.bold}${inbound.length}${c.reset} inbound to platform`
+    );
 
-      if (processedTxIds.has(tx.tx_id)) continue;
+    for (const tx of inbound) {
+      if (processedTxIds.has(tx.tx_id)) {
+        log.poll(`  ↩  Already processed: ${c.dim}${tx.tx_id.slice(0, 20)}...${c.reset}`);
+        continue;
+      }
 
       const memo = decodeMemo(tx.token_transfer?.memo);
-      if (!memo.startsWith("SSWAP_OFFRAMP_")) continue;
 
-      const tokenAmount = parseInt(tx.token_transfer.amount, 10) / 1_000_000; // µSTX → STX
+      if (!memo.startsWith("SSWAP_OFFRAMP_")) {
+        log.poll(`  ⊘  No matching memo (got: "${c.dim}${memo || "(empty)"}${c.reset}") — skipping`);
+        continue;
+      }
 
-      logger.info(`[Indexer] Found inbound STX transfer: ${tx.tx_id}`);
-      logger.info(`  Memo: ${memo} | Amount: ${tokenAmount} STX | From: ${tx.sender_address}`);
+      const tokenAmount = parseInt(tx.token_transfer.amount, 10) / 1_000_000;
+
+      log.tx(`\n  ┌─ 🟠 INBOUND STX TRANSFER DETECTED`);
+      log.tx(`  │  TX ID    : ${c.bold}${tx.tx_id}${c.reset}`);
+      log.tx(`  │  From     : ${tx.sender_address}`);
+      log.tx(`  │  Amount   : ${c.green}${c.bold}${tokenAmount} STX${c.reset}`);
+      log.tx(`  │  Memo     : ${c.yellow}${memo}${c.reset}`);
+      log.tx(`  └─ Triggering confirm-receipt...`);
 
       await callConfirmReceipt({
         transactionReference: memo,
@@ -93,7 +139,7 @@ async function checkInboundSTXTransfers() {
       processedTxIds.add(tx.tx_id);
     }
   } catch (err) {
-    logger.error(`[Indexer] STX poll error: ${err.message}`);
+    log.error(`STX poll failed: ${err.message}`);
   }
 }
 
@@ -102,7 +148,6 @@ async function checkInboundUSDCTransfers() {
   if (!PLATFORM_ADDRESS) return;
 
   try {
-    // Fetch contract call transactions for the USDC token contract
     const url = `${STACKS_API_BASE}/extended/v1/address/${USDC_FULL_ID}/transactions`;
     const res = await axios.get(url, {
       params: { limit: 50, offset: 0 },
@@ -110,11 +155,21 @@ async function checkInboundUSDCTransfers() {
     });
 
     const txs = res.data?.results || [];
+    const calls = txs.filter(
+      (tx) => tx.tx_status === "success" && tx.tx_type === "contract_call" &&
+              tx.contract_call?.function_name === "transfer"
+    );
 
-    for (const tx of txs) {
-      if (tx.tx_status !== "success" || tx.tx_type !== "contract_call") continue;
-      if (tx.contract_call?.function_name !== "transfer")              continue;
-      if (processedTxIds.has(tx.tx_id))                                continue;
+    log.poll(
+      `USDC scan complete — ${c.bold}${txs.length}${c.reset} txs fetched, ` +
+      `${c.bold}${calls.length}${c.reset} transfer() calls`
+    );
+
+    for (const tx of calls) {
+      if (processedTxIds.has(tx.tx_id)) {
+        log.poll(`  ↩  Already processed: ${c.dim}${tx.tx_id.slice(0, 20)}...${c.reset}`);
+        continue;
+      }
 
       // Parse FT transfer events to confirm recipient and amount
       const ftEvents = tx.events?.filter(
@@ -124,22 +179,28 @@ async function checkInboundUSDCTransfers() {
           e.asset?.recipient === PLATFORM_ADDRESS
       ) || [];
 
-      if (ftEvents.length === 0) continue;
+      if (ftEvents.length === 0) {
+        log.poll(`  ⊘  No FT events to platform address — skipping ${c.dim}${tx.tx_id.slice(0, 16)}...${c.reset}`);
+        continue;
+      }
 
-      // Memo is the 4th argument of SIP-010 transfer(amount, from, to, memo)
       const memoArg = tx.contract_call?.function_args?.[3];
-      const memo    = memoArg?.repr
-        ? decodeMemo(memoArg.repr.replace(/^0x/, ""))
-        : "";
+      const memo    = memoArg?.repr ? decodeMemo(memoArg.repr.replace(/^0x/, "")) : "";
 
-      if (!memo.startsWith("SSWAP_OFFRAMP_")) continue;
+      if (!memo.startsWith("SSWAP_OFFRAMP_")) {
+        log.poll(`  ⊘  No matching memo (got: "${c.dim}${memo || "(empty)"}${c.reset}") — skipping`);
+        continue;
+      }
 
-      // Sum all FT transfer amounts to this address (usually just one)
       const rawAmount   = ftEvents.reduce((sum, e) => sum + parseInt(e.asset.amount || "0", 10), 0);
-      const tokenAmount = rawAmount / 1_000_000; // USDC has 6 decimals
+      const tokenAmount = rawAmount / 1_000_000;
 
-      logger.info(`[Indexer] Found inbound USDC transfer: ${tx.tx_id}`);
-      logger.info(`  Memo: ${memo} | Amount: ${tokenAmount} USDC | From: ${tx.sender_address}`);
+      log.tx(`\n  ┌─ 🔵 INBOUND USDC TRANSFER DETECTED`);
+      log.tx(`  │  TX ID    : ${c.bold}${tx.tx_id}${c.reset}`);
+      log.tx(`  │  From     : ${tx.sender_address}`);
+      log.tx(`  │  Amount   : ${c.green}${c.bold}${tokenAmount} USDC${c.reset}`);
+      log.tx(`  │  Memo     : ${c.yellow}${memo}${c.reset}`);
+      log.tx(`  └─ Triggering confirm-receipt...`);
 
       await callConfirmReceipt({
         transactionReference: memo,
@@ -152,13 +213,18 @@ async function checkInboundUSDCTransfers() {
       processedTxIds.add(tx.tx_id);
     }
   } catch (err) {
-    logger.error(`[Indexer] USDC poll error: ${err.message}`);
+    log.error(`USDC poll failed: ${err.message}`);
   }
 }
 
 // ── Internal confirm-receipt call ────────────────────────────────────
 async function callConfirmReceipt(payload) {
   try {
+    log.info(
+      `Calling confirm-receipt → ${c.bold}${payload.transactionReference}${c.reset} ` +
+      `(${payload.tokenAmount} ${payload.token})`
+    );
+
     const res = await axios.post(
       `${SELF_BASE_URL}/api/offramp/confirm-receipt`,
       payload,
@@ -172,9 +238,16 @@ async function callConfirmReceipt(payload) {
     );
 
     if (res.data?.success) {
-      logger.info(`[Indexer] confirm-receipt OK: ${payload.transactionReference}`);
+      log.success(
+        `✅ NGN settlement initiated!\n` +
+        `  ${c.bold}Ref     :${c.reset} ${payload.transactionReference}\n` +
+        `  ${c.bold}Tokens  :${c.reset} ${payload.tokenAmount} ${payload.token}\n` +
+        `  ${c.bold}Stacks  :${c.reset} ${payload.stacksTxId}\n` +
+        `  ${c.bold}Lenco ID:${c.reset} ${res.data?.data?.lencoTransferId || "pending"}\n` +
+        `  ${c.bold}ETA     :${c.reset} ${res.data?.data?.estimatedSettlement || "5-15 min"}`
+      );
     } else {
-      logger.warn(`[Indexer] confirm-receipt non-success: ${JSON.stringify(res.data)}`);
+      log.warn(`confirm-receipt returned non-success: ${JSON.stringify(res.data)}`);
     }
   } catch (err) {
     const status  = err.response?.status;
@@ -182,48 +255,69 @@ async function callConfirmReceipt(payload) {
 
     // 404 = transaction not in DB yet (race condition) — will retry on next poll
     if (status === 404) {
-      logger.warn(`[Indexer] Transaction not found yet for ${payload.transactionReference} — will retry`);
-      // Remove from processed set so it's retried next poll
+      log.warn(
+        `⚠️  Transaction not in DB yet for ${payload.transactionReference}\n` +
+        `   Will retry on next poll cycle (~${POLL_INTERVAL_MS / 1000}s)`
+      );
       processedTxIds.delete(payload.stacksTxId);
       return;
     }
 
     // 401 = bad internal key — config error, log loudly
     if (status === 401) {
-      logger.error(`[Indexer] UNAUTHORIZED — check INTERNAL_API_KEY env var`);
+      log.error(
+        `🔐 UNAUTHORIZED — x-internal-key rejected\n` +
+        `   Check that INTERNAL_API_KEY env var matches the server config`
+      );
       return;
     }
 
-    logger.error(`[Indexer] confirm-receipt failed (${status}): ${message}`);
+    log.error(
+      `❌ confirm-receipt failed (HTTP ${status || "network error"}): ${message}\n` +
+      `   Ref: ${payload.transactionReference} | TX: ${payload.stacksTxId}`
+    );
   }
 }
 
 // ── Poll loop ────────────────────────────────────────────────────────
 let indexerInterval = null;
 
+async function runPoll() {
+  pollCount++;
+  log.poll(
+    `Poll #${c.bold}${pollCount}${c.reset} — ` +
+    `${c.dim}${new Date().toLocaleTimeString()}${c.reset} — ` +
+    `${c.dim}${processedTxIds.size} tx(s) in memory cache${c.reset}`
+  );
+  await Promise.all([checkInboundSTXTransfers(), checkInboundUSDCTransfers()]);
+}
+
 function startIndexer() {
   if (!PLATFORM_ADDRESS) {
-    logger.warn("[Indexer] PLATFORM_STX_ADDRESS not set — indexer disabled");
+    log.warn("PLATFORM_STX_ADDRESS not set — indexer disabled");
     return;
   }
   if (!INTERNAL_API_KEY) {
-    logger.warn("[Indexer] INTERNAL_API_KEY not set — indexer disabled");
+    log.warn("INTERNAL_API_KEY not set — indexer disabled");
     return;
   }
 
-  logger.info(`[Indexer] Starting — polling every ${POLL_INTERVAL_MS / 1000}s`);
-  logger.info(`[Indexer] Watching address: ${PLATFORM_ADDRESS}`);
+  log.banner("StackSwap Stacks Indexer");
+
+  console.log(`  ${c.bold}Platform wallet :${c.reset} ${c.cyan}${PLATFORM_ADDRESS}${c.reset}`);
+  console.log(`  ${c.bold}Stacks API      :${c.reset} ${STACKS_API_BASE}`);
+  console.log(`  ${c.bold}Backend URL     :${c.reset} ${SELF_BASE_URL}`);
+  console.log(`  ${c.bold}Poll interval   :${c.reset} every ${POLL_INTERVAL_MS / 1000}s`);
+  console.log(`  ${c.bold}USDC contract   :${c.reset} ${USDC_FULL_ID}`);
+  console.log();
+  console.log(`  ${c.green}Watching for inbound STX transfers and USDC contract calls...${c.reset}`);
+  console.log(`  ${c.dim}(Set NO_COLOR=1 to disable ANSI colors in log files)${c.reset}\n`);
 
   // Run once immediately on startup
-  Promise.all([checkInboundSTXTransfers(), checkInboundUSDCTransfers()]).catch(
-    (err) => logger.error(`[Indexer] Initial poll error: ${err.message}`)
-  );
+  runPoll().catch((err) => log.error(`Initial poll error: ${err.message}`));
 
-  indexerInterval = setInterval(async () => {
-    await Promise.all([
-      checkInboundSTXTransfers(),
-      checkInboundUSDCTransfers(),
-    ]);
+  indexerInterval = setInterval(() => {
+    runPoll().catch((err) => log.error(`Poll error: ${err.message}`));
   }, POLL_INTERVAL_MS);
 
   // Graceful shutdown
@@ -235,7 +329,7 @@ function stopIndexer() {
   if (indexerInterval) {
     clearInterval(indexerInterval);
     indexerInterval = null;
-    logger.info("[Indexer] Stopped");
+    log.info(`Stopped after ${pollCount} poll(s). Goodbye.`);
   }
 }
 

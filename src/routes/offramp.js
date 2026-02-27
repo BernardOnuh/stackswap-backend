@@ -1,7 +1,10 @@
 // ============= routes/offramp.js =============
+// UPDATED: confirm-receipt is now called only by the server-side Stacks
+// indexer (services/stacksIndexer.js), never from the browser.
+// The NEXT_PUBLIC_INTERNAL_KEY env var has been removed from the frontend.
 
 const express = require("express");
-const router = express.Router();
+const router  = express.Router();
 const {
   getBankList,
   getOfframpRate,
@@ -12,6 +15,19 @@ const {
   getOfframpStatus,
   getOfframpHistory,
 } = require("../controllers/offrampController");
+
+/**
+ * Middleware: restrict an endpoint to server-to-server calls only.
+ * Rejects any request missing a valid x-internal-key header.
+ * Used to protect confirm-receipt from direct browser access.
+ */
+function requireInternalKey(req, res, next) {
+  const key = req.headers["x-internal-key"];
+  if (!key || key !== process.env.INTERNAL_API_KEY) {
+    return res.status(401).json({ success: false, message: "Unauthorized" });
+  }
+  next();
+}
 
 /**
  * @swagger
@@ -136,6 +152,11 @@ router.post("/verify-account", verifyAccount);
  *       transaction, and returns a deposit address + memo.
  *       The user must then send exactly `tokenAmount` of `token` to `depositInstructions.sendTo`
  *       with `transactionReference` as the memo/note within 30 minutes.
+ *
+ *       After the user signs the wallet transaction, the server-side Stacks indexer
+ *       (stacksIndexer.js) detects the on-chain transfer and automatically calls
+ *       confirm-receipt to trigger the NGN payout. The frontend does NOT call
+ *       confirm-receipt directly.
  *     requestBody:
  *       required: true
  *       content:
@@ -184,9 +205,16 @@ router.post("/initialize", initializeOfframp);
  *     summary: "[Internal] Confirm on-chain token receipt and trigger NGN payout"
  *     tags: [Offramp]
  *     description: |
- *       Called by the Stacks blockchain indexer when it detects the inbound token transfer
- *       to the deposit address with the correct memo. Triggers the Lenco NGN bank transfer.
- *       Secured by `x-internal-key` header — not for public use.
+ *       Called exclusively by the server-side Stacks blockchain indexer
+ *       (services/stacksIndexer.js) when it detects an inbound token transfer
+ *       to the deposit address with a matching SSWAP_OFFRAMP_ memo.
+ *       Triggers the Lenco NGN bank transfer.
+ *
+ *       SECURITY: Protected by requireInternalKey middleware (x-internal-key header).
+ *       This endpoint must NEVER be called from the browser — doing so would:
+ *         1. Cause EPROTO SSL errors (browser TLS vs internal endpoint mismatch)
+ *         2. Expose the internal key in the client bundle via NEXT_PUBLIC_*
+ *       The indexer handles all server-to-server communication securely.
  *     security:
  *       - InternalApiKey: []
  *     requestBody:
@@ -215,11 +243,11 @@ router.post("/initialize", initializeOfframp);
  *       401:
  *         description: Unauthorized — missing or invalid x-internal-key
  *       404:
- *         description: Transaction not found
+ *         description: Transaction not found (indexer will retry on next poll)
  *       500:
  *         description: Lenco transfer failed — manual action required
  */
-router.post("/confirm-receipt", confirmTokenReceipt);
+router.post("/confirm-receipt", requireInternalKey, confirmTokenReceipt);
 
 /**
  * @swagger
@@ -244,7 +272,7 @@ router.post("/lenco-webhook", handleLencoWebhook);
  *   get:
  *     summary: Get status of an offramp transaction
  *     tags: [Offramp]
- *     description: Polled by the frontend sell_deposit step to track transaction progress.
+ *     description: Polled by the frontend sell_pending step to track transaction progress.
  *     parameters:
  *       - in: path
  *         name: reference
