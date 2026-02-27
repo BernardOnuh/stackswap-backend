@@ -141,8 +141,8 @@ async function initiateLencoTransfer(amountNGN, accountNumber, bankCode, account
     accountNumber,
     bankCode,
     accountName,
-    debitAccountId,
-    clientReference: reference,
+    senderAccountId: debitAccountId,
+    reference:       reference,
     narration:       `StackSwap offramp - ${reference}`,
   };
 
