@@ -135,15 +135,14 @@ async function initiateLencoTransfer(amountNGN, accountNumber, bankCode, account
   ]);
 
   if (!debitAccountId) throw new Error("LENCO_ACCOUNT_ID not configured — needed to debit your Lenco account");
-
   const payload = {
-    amount:          amountNGN,
+    amount:      amountNGN,
     accountNumber,
     bankCode,
     accountName,
-    senderAccountId: debitAccountId,
-    reference:       reference,
-    narration:       `StackSwap offramp - ${reference}`,
+    debitAccountId,
+    reference,        // ← change "clientReference: reference" to just "reference"
+    narration:   `StackSwap offramp - ${reference}`,
   };
 
   llog.data("Lenco transfer request body", payload);
