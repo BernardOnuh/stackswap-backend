@@ -7,13 +7,13 @@ const {
   getOfframpRate,
   verifyAccount,
   initializeOfframp,
-  notifyTxBroadcast,        // ← ADDED: triggers background poll after wallet signs
+  notifyTxBroadcast,
   confirmTokenReceipt,
   handleLencoWebhook,
   getOfframpStatus,
   getOfframpHistory,
+  getLiquidityInfo,       // ← ADD THIS
 } = require("../controllers/offrampController");
-
 /**
  * Middleware: restrict an endpoint to server-to-server calls only.
  * Rejects any request missing a valid x-internal-key header.
@@ -303,23 +303,32 @@ router.post("/lenco-webhook", handleLencoWebhook);
 
 /**
  * @swagger
- * /api/offramp/status/{reference}:
+ * /api/offramp/liquidity:
  *   get:
- *     summary: Get status of an offramp transaction
+ *     summary: Check platform NGN liquidity
  *     tags: [Offramp]
- *     parameters:
- *       - in: path
- *         name: reference
- *         required: true
- *         schema:
- *           type: string
- *         example: SSWAP_OFFRAMP_LKJHG_A1B2C3D4
+ *     description: |
+ *       Returns whether the platform has enough NGN to fulfil orders right now,
+ *       and the maximum single order amount that can be processed.
+ *       Does NOT expose raw balance — returns sanitised maxOrderNGN only.
  *     responses:
  *       200:
- *         description: Transaction status and details
- *       404:
- *         description: Not found
+ *         description: Liquidity info
+ *         content:
+ *           application/json:
+ *             example:
+ *               success: true
+ *               data:
+ *                 available: true
+ *                 maxOrderNGN: 245000
+ *                 minBufferNGN: 5000
+ *                 checkedAt: "2026-03-01T12:00:00.000Z"
+ *       503:
+ *         description: Liquidity check temporarily unavailable
  */
+router.get("/liquidity", getLiquidityInfo);
+
+
 router.get("/status/:reference", getOfframpStatus);
 
 /**
