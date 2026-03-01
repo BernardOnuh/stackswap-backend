@@ -77,31 +77,34 @@ async function getLencoAccountBalance(forceRefresh = false) {
     return lencoBalanceCache;
   }
 
-  llog.info(`Fetching Lenco account balance... (accountId: ${debitAccountId})`);
+  // ✅ CORRECT ENDPOINT: /access/v1/account/:id/balance  (singular "account")
+  // NOT /access/v1/accounts/:id — that returns full account object, not balance
+  const url = `${LENCO_BASE_URL}/access/v1/account/${debitAccountId}/balance`;
+  llog.info(`Fetching Lenco account balance... GET ${url}`);
 
   try {
-    // Lenco GET /access/v1/accounts/:accountId returns account details including balance
-    const res = await axios.get(`${LENCO_BASE_URL}/access/v1/accounts/${debitAccountId}`, {
+    const res = await axios.get(url, {
       headers: { Authorization: `Bearer ${LENCO_API_KEY}`, "Content-Type": "application/json" },
       timeout: 10000,
     });
 
     llog.info(`  HTTP ${res.status}`);
-    llog.data("Lenco account response", res.data);
+    llog.data("Lenco balance response", res.data);
 
     if (!res.data?.status) {
       throw new Error(res.data?.message || "Failed to fetch account balance");
     }
 
-    // Lenco returns balance in kobo (smallest unit) — convert to NGN
-    // e.g. 500000 kobo = ₦5,000
-    const balanceRaw = res.data?.data?.availableBalance ?? res.data?.data?.balance ?? 0;
+    // Dedicated balance endpoint returns:
+    // { status: true, data: { balance: number, ledgerBalance: number } }
+    // Balance is in KOBO — divide by 100 to get NGN
+    const balanceRaw = res.data?.data?.balance ?? res.data?.data?.availableBalance ?? 0;
     const balanceNGN = balanceRaw / 100; // kobo → NGN
 
     lencoBalanceCache    = balanceNGN;
     lencoBalanceCachedAt = now;
 
-    llog.success(`Lenco balance: ${c.bold}${c.green}₦${balanceNGN.toLocaleString()}${c.reset} (raw: ${balanceRaw} kobo)`);
+    llog.success(`Lenco balance: ₦${balanceNGN.toLocaleString()} (raw: ${balanceRaw} kobo)`);
     return balanceNGN;
 
   } catch (err) {
@@ -110,12 +113,11 @@ async function getLencoAccountBalance(forceRefresh = false) {
     } else {
       llog.error(`Lenco balance network error: ${err.message}`);
     }
-    // Return cached value if we have one (even stale) rather than hard-failing
     if (lencoBalanceCache !== null) {
       llog.warn(`Using stale cached balance: ₦${lencoBalanceCache.toLocaleString()}`);
       return lencoBalanceCache;
     }
-    return null; // null = unknown, caller decides how to handle
+    return null;
   }
 }
 
