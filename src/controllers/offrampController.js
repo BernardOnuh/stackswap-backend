@@ -22,7 +22,7 @@ const SETTLEMENT_TIMEOUT_MINUTES = 30;
 
 // ── Liquidity buffer: reject orders if balance would drop below this amount ──
 // Set LENCO_MIN_BALANCE_NGN in your .env — defaults to 5,000 NGN safety cushion
-const LENCO_MIN_BALANCE_NGN = parseFloat(process.env.LENCO_MIN_BALANCE_NGN || "5000");
+const LENCO_MIN_BALANCE_NGN = parseFloat(process.env.LENCO_MIN_BALANCE_NGN || "0");
 
 // ── Bank list cache ──────────────────────────────────────────────────────────
 let bankListCache    = null;
