@@ -20,10 +20,19 @@ const MIN_TOKEN_AMOUNT      = parseFloat(process.env.OFFRAMP_MIN_TOKEN     || "1
 const MAX_TOKEN_AMOUNT      = parseFloat(process.env.OFFRAMP_MAX_TOKEN     || "50000");
 const SETTLEMENT_TIMEOUT_MINUTES = 30;
 
+// ── Liquidity buffer: reject orders if balance would drop below this amount ──
+// Set LENCO_MIN_BALANCE_NGN in your .env — defaults to 5,000 NGN safety cushion
+const LENCO_MIN_BALANCE_NGN = parseFloat(process.env.LENCO_MIN_BALANCE_NGN || "5000");
+
 // ── Bank list cache ──────────────────────────────────────────────────────────
 let bankListCache    = null;
 let bankListCachedAt = null;
 const BANK_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// ── Lenco balance cache (short TTL — 30 seconds) ─────────────────────────────
+let lencoBalanceCache     = null;
+let lencoBalanceCachedAt  = null;
+const BALANCE_CACHE_TTL_MS = 30 * 1000; // 30 seconds
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +56,119 @@ function verifyLencoSignature(payload, signature) {
     log.error(`Signature mismatch\n  Expected: ${hash}\n  Got     : ${signature}`);
   }
   return match;
+}
+
+// ── Lenco Balance Check ───────────────────────────────────────────────────────
+// Fetches the NGN balance of the platform's Lenco account.
+// Uses a short cache (30s) to avoid hammering the API on every order attempt.
+
+async function getLencoAccountBalance(forceRefresh = false) {
+  const debitAccountId = process.env.LENCO_ACCOUNT_ID;
+  if (!debitAccountId) {
+    llog.warn("LENCO_ACCOUNT_ID not set — skipping balance check");
+    return null;
+  }
+
+  const now        = Date.now();
+  const cacheStale = !lencoBalanceCachedAt || now - lencoBalanceCachedAt > BALANCE_CACHE_TTL_MS;
+
+  if (!forceRefresh && lencoBalanceCache !== null && !cacheStale) {
+    llog.info(`Balance cache hit — ₦${lencoBalanceCache.toLocaleString()} (age: ${Math.round((now - lencoBalanceCachedAt) / 1000)}s)`);
+    return lencoBalanceCache;
+  }
+
+  llog.info(`Fetching Lenco account balance... (accountId: ${debitAccountId})`);
+
+  try {
+    // Lenco GET /access/v1/accounts/:accountId returns account details including balance
+    const res = await axios.get(`${LENCO_BASE_URL}/access/v1/accounts/${debitAccountId}`, {
+      headers: { Authorization: `Bearer ${LENCO_API_KEY}`, "Content-Type": "application/json" },
+      timeout: 10000,
+    });
+
+    llog.info(`  HTTP ${res.status}`);
+    llog.data("Lenco account response", res.data);
+
+    if (!res.data?.status) {
+      throw new Error(res.data?.message || "Failed to fetch account balance");
+    }
+
+    // Lenco returns balance in kobo (smallest unit) — convert to NGN
+    // e.g. 500000 kobo = ₦5,000
+    const balanceRaw = res.data?.data?.availableBalance ?? res.data?.data?.balance ?? 0;
+    const balanceNGN = balanceRaw / 100; // kobo → NGN
+
+    lencoBalanceCache    = balanceNGN;
+    lencoBalanceCachedAt = now;
+
+    llog.success(`Lenco balance: ${c.bold}${c.green}₦${balanceNGN.toLocaleString()}${c.reset} (raw: ${balanceRaw} kobo)`);
+    return balanceNGN;
+
+  } catch (err) {
+    if (err.response) {
+      llog.error(`Lenco balance HTTP ${err.response.status}: ${err.response.data?.message || JSON.stringify(err.response.data)}`);
+    } else {
+      llog.error(`Lenco balance network error: ${err.message}`);
+    }
+    // Return cached value if we have one (even stale) rather than hard-failing
+    if (lencoBalanceCache !== null) {
+      llog.warn(`Using stale cached balance: ₦${lencoBalanceCache.toLocaleString()}`);
+      return lencoBalanceCache;
+    }
+    return null; // null = unknown, caller decides how to handle
+  }
+}
+
+// ── Liquidity check: can we fulfil this order? ────────────────────────────────
+// Returns { ok: true } or { ok: false, reason, availableNGN, requiredNGN }
+
+async function checkLiquidity(requiredNGN) {
+  llog.info(`Checking liquidity — order needs: ${c.bold}₦${requiredNGN.toLocaleString()}${c.reset} | minimum buffer: ₦${LENCO_MIN_BALANCE_NGN.toLocaleString()}`);
+
+  const balanceNGN = await getLencoAccountBalance();
+
+  if (balanceNGN === null) {
+    // Can't reach Lenco — fail safe: reject the order
+    llog.warn("Balance unknown (Lenco unreachable) — rejecting order as precaution");
+    return {
+      ok: false,
+      reason: "Unable to verify liquidity at this time. Please try again in a moment.",
+      availableNGN: null,
+      requiredNGN,
+    };
+  }
+
+  // Total needed = payout amount + safety buffer
+  const totalNeeded = requiredNGN + LENCO_MIN_BALANCE_NGN;
+
+  if (balanceNGN < totalNeeded) {
+    const shortfall = totalNeeded - balanceNGN;
+    llog.error(
+      `Insufficient liquidity!\n` +
+      `  Balance     : ₦${balanceNGN.toLocaleString()}\n` +
+      `  Order needs : ₦${requiredNGN.toLocaleString()}\n` +
+      `  Buffer      : ₦${LENCO_MIN_BALANCE_NGN.toLocaleString()}\n` +
+      `  Total needed: ₦${totalNeeded.toLocaleString()}\n` +
+      `  Shortfall   : ${c.red}₦${shortfall.toLocaleString()}${c.reset}`
+    );
+    return {
+      ok: false,
+      reason: "Insufficient liquidity to process this order right now. Please try a smaller amount or come back shortly.",
+      availableNGN: balanceNGN,
+      requiredNGN,
+      shortfallNGN: shortfall,
+    };
+  }
+
+  llog.success(
+    `Liquidity OK — balance ₦${balanceNGN.toLocaleString()} ≥ required ₦${totalNeeded.toLocaleString()} ` +
+    `(order ₦${requiredNGN.toLocaleString()} + buffer ₦${LENCO_MIN_BALANCE_NGN.toLocaleString()})`
+  );
+  return {
+    ok: true,
+    availableNGN: balanceNGN,
+    requiredNGN,
+  };
 }
 
 async function calculateOfframpQuote(token, tokenAmount) {
@@ -137,10 +259,9 @@ async function initiateLencoTransfer(amountNGN, accountNumber, bankCode, account
 
   if (!debitAccountId) throw new Error("LENCO_ACCOUNT_ID not configured — needed to debit your Lenco account");
 
-  // ✅ FIX: use "accountId" (not "debitAccountId"), amount as string, remove accountName
   const payload = {
     accountId:    debitAccountId,
-    amount:       String(amountNGN),  // whole number string e.g. "249"
+    amount:       String(amountNGN),
     accountNumber,
     bankCode,
     narration:    `StackSwap offramp - ${reference}`,
@@ -168,6 +289,13 @@ async function initiateLencoTransfer(amountNGN, accountNumber, bankCode, account
       reference,
     };
     llog.success(`Transfer initiated — ID: ${c.bold}${result.transferId}${c.reset} | Status: ${result.status}`);
+
+    // Bust the balance cache immediately after a transfer so the next order
+    // sees the updated (lower) balance
+    lencoBalanceCache    = null;
+    lencoBalanceCachedAt = null;
+    llog.info("Balance cache invalidated after transfer");
+
     return result;
   } catch (err) {
     if (err.response) {
@@ -242,7 +370,7 @@ async function getOfframpRate(req, res) {
       quote = { token: token.toUpperCase(), marketRateNGN: parseFloat(tokenData.priceNGN.toFixed(2)), flatFeeNGN: OFFRAMP_FLAT_FEE_NGN, priceUSD: tokenData.priceUSD, usdToNgn: tokenData.usdToNgn };
     }
     log.success(`Rate fetched for ${token}: ₦${quote.marketRateNGN}`);
-    res.json({ success: true, data: { ...quote, limits: { minToken: MIN_TOKEN_AMOUNT, maxToken: MAX_TOKEN_AMOUNT }, estimatedSettlement: "5-15 minutes", fetchedAt: new Date().toISOString() } });
+    res.json({ success: true, data: { ...quote, limits: { minToken: MIN_TOKEN_AMOUNT, maxToken: MAX_TOKEN_AMOUNT }, estimatedSettlement: "30-60 seconds", fetchedAt: new Date().toISOString() } });
   } catch (err) {
     log.error(`getOfframpRate error: ${err.message}`);
     res.status(500).json({ success: false, message: err.message });
@@ -260,6 +388,45 @@ async function verifyAccount(req, res) {
   } catch (err) {
     log.error(`verifyAccount error: ${err.message}`);
     res.status(400).json({ success: false, message: err.message });
+  }
+}
+
+// ── NEW: Public endpoint to expose available liquidity to the frontend ────────
+// GET /api/offramp/liquidity
+// Returns the platform's available NGN balance so the UI can warn users early.
+// Does NOT expose the raw balance — returns a sanitised "maxOrderNGN" instead.
+
+async function getLiquidityInfo(req, res) {
+  log.info("GET /liquidity — checking platform liquidity");
+  try {
+    const balanceNGN = await getLencoAccountBalance(true); // force refresh
+
+    if (balanceNGN === null) {
+      return res.status(503).json({
+        success: false,
+        message: "Liquidity check temporarily unavailable",
+        available: false,
+      });
+    }
+
+    // Max single order = balance minus the safety buffer
+    const maxOrderNGN = Math.max(0, Math.floor(balanceNGN - LENCO_MIN_BALANCE_NGN));
+    const available   = maxOrderNGN > 0;
+
+    log.info(`Liquidity: balance=₦${balanceNGN.toLocaleString()} maxOrder=₦${maxOrderNGN.toLocaleString()} available=${available}`);
+
+    res.json({
+      success: true,
+      data: {
+        available,          // bool — true if any orders can be processed
+        maxOrderNGN,        // max NGN value of a single order we can fulfil right now
+        minBufferNGN: LENCO_MIN_BALANCE_NGN,
+        checkedAt: new Date().toISOString(),
+      },
+    });
+  } catch (err) {
+    log.error(`getLiquidityInfo error: ${err.message}`);
+    res.status(500).json({ success: false, message: err.message });
   }
 }
 
@@ -316,8 +483,37 @@ async function initializeOfframp(req, res) {
     log.step(3, "Calculating NGN quote...");
     const quote = await calculateOfframpQuote(upperToken, amount);
 
-    // Step 4: Create transaction
-    log.step(4, "Creating pending transaction in DB...");
+    // ── Step 4: LIQUIDITY CHECK ───────────────────────────────────────────────
+    // Verify the platform's Lenco account has enough NGN to fulfil this payout
+    // BEFORE we create the DB record or ask the user to sign anything.
+    log.step(4, "Checking Lenco account liquidity...");
+    const liquidity = await checkLiquidity(quote.ngnAmount);
+
+    if (!liquidity.ok) {
+      divider("🚫 ORDER REJECTED — INSUFFICIENT LIQUIDITY");
+      log.error(
+        `Rejected order:\n` +
+        `  Required : ₦${quote.ngnAmount.toLocaleString()}\n` +
+        `  Available: ${liquidity.availableNGN !== null ? "₦" + liquidity.availableNGN.toLocaleString() : "unknown"}\n` +
+        `  Reason   : ${liquidity.reason}`
+      );
+      return res.status(503).json({
+        success: false,
+        message: liquidity.reason,
+        code: "INSUFFICIENT_LIQUIDITY",
+        data: {
+          requiredNGN:   quote.ngnAmount,
+          // We deliberately don't expose the raw balance to end users for security.
+          // We only tell them the max they CAN sell right now (if knowable).
+          maxOrderNGN: liquidity.availableNGN !== null
+            ? Math.max(0, Math.floor(liquidity.availableNGN - LENCO_MIN_BALANCE_NGN))
+            : null,
+        },
+      });
+    }
+
+    // Step 5: Create transaction
+    log.step(5, "Creating pending transaction in DB...");
     const transactionReference = generateReference();
     const expiresAt            = new Date(Date.now() + SETTLEMENT_TIMEOUT_MINUTES * 60 * 1000);
 
@@ -347,6 +543,8 @@ async function initializeOfframp(req, res) {
         depositAddress,
         expiresAt:       expiresAt.toISOString(),
         lencoTransferId: null,
+        // Record the balance snapshot at time of order for audit trail
+        balanceAtOrderTime: liquidity.availableNGN,
       },
     });
 
@@ -360,6 +558,7 @@ async function initializeOfframp(req, res) {
       `${c.bold}Net NGN    :${c.reset} ${c.green}₦${quote.ngnAmount.toLocaleString()}${c.reset}`,
       `${c.bold}Expires at :${c.reset} ${expiresAt.toISOString()}`,
       `${c.bold}Bank       :${c.reset} ${bankDetails.accountName} — ${bankDetails.bankName} ${accountNumber}`,
+      `${c.bold}Balance    :${c.reset} ₦${liquidity.availableNGN?.toLocaleString()} (at order time)`,
     ]);
 
     log.info(`⏳ Waiting for user to broadcast TX on Stacks...`);
@@ -406,7 +605,6 @@ async function initializeOfframp(req, res) {
 }
 
 // ── notifyTxBroadcast + pollAndSettle ─────────────────────────────────────────
-// Called by frontend immediately after wallet signs. Starts background polling.
 
 async function notifyTxBroadcast(req, res) {
   const { transactionReference, stacksTxId } = req.body;
@@ -436,20 +634,17 @@ async function notifyTxBroadcast(req, res) {
     return res.json({ success: true, message: "Already processing" });
   }
 
-  // Save txId immediately
   tx.txId = stacksTxId;
   tx.meta = { ...tx.meta, stacksTxId, notifiedAt: new Date().toISOString() };
   await tx.save();
   log.success(`TX ID saved to DB — starting background polling`);
 
-  // Respond immediately — don't block frontend
   res.json({
     success: true,
     message: "TX received. Monitoring confirmation and triggering NGN payout.",
     data: { transactionReference, stacksTxId },
   });
 
-  // Fire-and-forget background poll
   pollAndSettle(tx, stacksTxId, transactionReference).catch((err) => {
     log.error(`pollAndSettle crashed for ${transactionReference}: ${err.message}`);
     log.error(err.stack);
@@ -457,8 +652,8 @@ async function notifyTxBroadcast(req, res) {
 }
 
 async function pollAndSettle(tx, stacksTxId, reference) {
-  const MAX_ATTEMPTS    = 120;    // 10 minutes total
-  const POLL_INTERVAL   = 5000;   // 5 seconds
+  const MAX_ATTEMPTS    = 120;
+  const POLL_INTERVAL   = 5000;
   const explorerBase    = "https://explorer.hiro.so/txid";
 
   divider("🔄 POLLING STACKS FOR TX CONFIRMATION");
@@ -490,7 +685,6 @@ async function pollAndSettle(tx, stacksTxId, reference) {
         `burn_block_time = ${data.burn_block_time_iso || "N/A"}`
       );
 
-      // ── CONFIRMED ─────────────────────────────────────────────────────────
       if (data.tx_status === "success") {
         divider("✅ STACKS TX CONFIRMED");
         plog.success(`TX confirmed on-chain at block ${data.block_height}`);
@@ -501,33 +695,25 @@ async function pollAndSettle(tx, stacksTxId, reference) {
           `${c.bold}Attempt      :${c.reset} ${attempt} (${(attempt * POLL_INTERVAL / 1000)}s elapsed)`,
         ]);
 
-        // Re-fetch tx to avoid race with indexer
         const freshTx = await Transaction.findOne({ paymentReference: reference });
         plog.info(`Fresh DB status: ${c.bold}${freshTx?.status}${c.reset}`);
 
-        if (!freshTx) {
-          plog.error(`TX disappeared from DB for reference ${reference}!`);
-          return;
-        }
+        if (!freshTx) { plog.error(`TX disappeared from DB for reference ${reference}!`); return; }
         if (["confirmed", "settling", "processing"].includes(freshTx.status)) {
-          plog.warn(`Already handled by indexer (status: ${freshTx.status}) — skipping to avoid duplicate payout`);
+          plog.warn(`Already handled by indexer (status: ${freshTx.status}) — skipping`);
           return;
         }
 
-        // Extract confirmed amount from blockchain events
         let confirmedAmount = tx.tokenAmount;
         plog.info(`Parsing blockchain events for amount verification...`);
         try {
           const events = data.events || [];
           plog.info(`  Found ${events.length} event(s)`);
           events.forEach((e, i) => plog.info(`  Event ${i}: type=${e.event_type} amount=${e.asset?.amount || "N/A"}`));
-
-          const ftEvent = events.find(
-            (e) => e.event_type === "fungible_token_asset" || e.event_type === "stx_asset"
-          );
+          const ftEvent = events.find((e) => e.event_type === "fungible_token_asset" || e.event_type === "stx_asset");
           if (ftEvent?.asset?.amount) {
             confirmedAmount = parseInt(ftEvent.asset.amount) / 1_000_000;
-            plog.info(`  Confirmed amount from event: ${c.bold}${confirmedAmount}${c.reset} (raw: ${ftEvent.asset.amount})`);
+            plog.info(`  Confirmed amount from event: ${c.bold}${confirmedAmount}${c.reset}`);
           } else {
             plog.warn(`  No FT/STX event found — using stored amount: ${confirmedAmount}`);
           }
@@ -535,21 +721,13 @@ async function pollAndSettle(tx, stacksTxId, reference) {
           plog.warn(`  Event parsing error: ${parseErr.message} — using stored amount`);
         }
 
-        // Update DB → processing
-        plog.info(`Updating DB status: settling → processing...`);
+        plog.info(`Updating DB status → processing...`);
         freshTx.status = "processing";
         freshTx.txId   = stacksTxId;
-        freshTx.meta   = {
-          ...freshTx.meta,
-          stacksTxId,
-          tokenReceivedAt:   new Date().toISOString(),
-          confirmedAttempt:  attempt,
-          confirmedAmount,
-        };
+        freshTx.meta   = { ...freshTx.meta, stacksTxId, tokenReceivedAt: new Date().toISOString(), confirmedAttempt: attempt, confirmedAmount };
         await freshTx.save();
         plog.success(`DB updated to "processing"`);
 
-        // Trigger Lenco
         plog.info(`Triggering Lenco NGN payout...`);
         box([
           `${c.bold}Amount NGN   :${c.reset} ${c.green}₦${freshTx.ngnAmount.toLocaleString()}${c.reset}`,
@@ -560,31 +738,12 @@ async function pollAndSettle(tx, stacksTxId, reference) {
         ]);
 
         try {
-          const lencoResult = await initiateLencoTransfer(
-            freshTx.ngnAmount,
-            freshTx.meta.accountNumber,
-            freshTx.meta.bankCode,
-            freshTx.meta.accountName,
-            reference
-          );
-
+          const lencoResult = await initiateLencoTransfer(freshTx.ngnAmount, freshTx.meta.accountNumber, freshTx.meta.bankCode, freshTx.meta.accountName, reference);
           freshTx.status = "settling";
-          freshTx.meta   = {
-            ...freshTx.meta,
-            lencoTransferId:       lencoResult.transferId,
-            lencoReference:        lencoResult.lencoReference,
-            settlementInitiatedAt: new Date().toISOString(),
-          };
+          freshTx.meta   = { ...freshTx.meta, lencoTransferId: lencoResult.transferId, lencoReference: lencoResult.lencoReference, settlementInitiatedAt: new Date().toISOString() };
           await freshTx.save();
-
           divider("🎉 NGN PAYOUT INITIATED");
-          llog.success(
-            `Lenco transfer created!\n` +
-            `  Lenco ID  : ${c.bold}${lencoResult.transferId}${c.reset}\n` +
-            `  Reference : ${lencoResult.lencoReference}\n` +
-            `  Status    : ${lencoResult.status}\n` +
-            `  Amount    : ${c.green}₦${freshTx.ngnAmount.toLocaleString()}${c.reset} → ${freshTx.meta.accountName}`
-          );
+          llog.success(`Lenco transfer created!\n  Lenco ID  : ${c.bold}${lencoResult.transferId}${c.reset}\n  Reference : ${lencoResult.lencoReference}\n  Status    : ${lencoResult.status}\n  Amount    : ${c.green}₦${freshTx.ngnAmount.toLocaleString()}${c.reset} → ${freshTx.meta.accountName}`);
         } catch (lencoErr) {
           divider("❌ LENCO TRANSFER FAILED");
           llog.error(`Lenco payout failed for ${reference}: ${lencoErr.message}`);
@@ -598,66 +757,46 @@ async function pollAndSettle(tx, stacksTxId, reference) {
             `${c.bold}To name    :${c.reset} ${freshTx.meta.accountName}`,
           ]);
           freshTx.status = "failed";
-          freshTx.meta   = {
-            ...freshTx.meta,
-            failureReason:            `Lenco failed: ${lencoErr.message}`,
-            requiresManualSettlement: true,
-          };
+          freshTx.meta   = { ...freshTx.meta, failureReason: `Lenco failed: ${lencoErr.message}`, requiresManualSettlement: true };
           await freshTx.save();
         }
 
-        return; // Exit poll loop
-      }
-
-      // ── ABORTED ───────────────────────────────────────────────────────────
-      if (data.tx_status === "abort_by_response" || data.tx_status === "abort_by_post_condition") {
-        divider("🚫 STACKS TX ABORTED");
-        plog.error(`TX aborted — status: ${data.tx_status}`);
-        plog.error(`This usually means the post-condition failed (e.g. wrong amount, insufficient balance)`);
-        box([
-          `${c.bold}TX ID  :${c.reset} ${stacksTxId}`,
-          `${c.bold}Reason :${c.reset} ${data.tx_status}`,
-          `${c.bold}Action :${c.reset} Transaction cancelled, no NGN will be sent`,
-        ]);
-        const failTx = await Transaction.findOne({ paymentReference: reference });
-        if (failTx) {
-          failTx.status = "failed";
-          failTx.meta   = { ...failTx.meta, failureReason: `Stacks TX aborted: ${data.tx_status}` };
-          await failTx.save();
-        }
         return;
       }
 
-      // ── DROPPED ───────────────────────────────────────────────────────────
-      if (data.tx_status === "dropped_replace_by_fee" || data.tx_status === "dropped_too_expensive") {
-        plog.warn(`TX was dropped from mempool: ${data.tx_status} — keep polling in case it gets rebroadcast`);
+      if (data.tx_status === "abort_by_response" || data.tx_status === "abort_by_post_condition") {
+        divider("🚫 STACKS TX ABORTED");
+        plog.error(`TX aborted — status: ${data.tx_status}`);
+        const failTx = await Transaction.findOne({ paymentReference: reference });
+        if (failTx) { failTx.status = "failed"; failTx.meta = { ...failTx.meta, failureReason: `Stacks TX aborted: ${data.tx_status}` }; await failTx.save(); }
+        return;
       }
 
-      // Still pending — keep polling
-      if (attempt % 6 === 0) { // Every 30s print a reminder
+      if (data.tx_status === "dropped_replace_by_fee" || data.tx_status === "dropped_too_expensive") {
+        plog.warn(`TX was dropped from mempool: ${data.tx_status}`);
+      }
+
+      if (attempt % 6 === 0) {
         plog.info(`Still waiting... ${c.dim}(${attempt * POLL_INTERVAL / 1000}s elapsed)${c.reset}`);
         plog.info(`  Track on explorer: ${explorerBase}/${stacksTxId}`);
       }
 
     } catch (err) {
       if (err.response?.status === 404) {
-        plog.warn(`Attempt ${attempt}: TX not found on API yet (404) — normal if just broadcast, retrying...`);
+        plog.warn(`Attempt ${attempt}: TX not found on API yet (404) — retrying...`);
       } else {
         plog.warn(`Attempt ${attempt}: API error — ${err.message} — will retry`);
       }
     }
   }
 
-  // Timeout
   divider("⏰ POLL TIMEOUT");
-  plog.error(`Gave up after ${MAX_ATTEMPTS} attempts (${MAX_ATTEMPTS * POLL_INTERVAL / 1000}s) for ${reference}`);
-  plog.error(`Manual check required: ${explorerBase}/${stacksTxId}`);
+  plog.error(`Gave up after ${MAX_ATTEMPTS} attempts for ${reference}`);
   const timeoutTx = await Transaction.findOne({ paymentReference: reference });
   if (timeoutTx && timeoutTx.status === "pending") {
     timeoutTx.status = "failed";
     timeoutTx.meta   = { ...timeoutTx.meta, failureReason: "Poll timeout — TX not confirmed within 10 minutes" };
     await timeoutTx.save();
-    plog.error(`DB updated to "failed" — manual resolution needed`);
   }
 }
 
@@ -680,40 +819,32 @@ async function confirmTokenReceipt(req, res) {
     }
 
     const tx = await Transaction.findOne({ paymentReference: transactionReference, direction: "offramp" });
-    if (!tx) {
-      log.error(`Transaction not found in DB: ${transactionReference}`);
-      return res.status(404).json({ success: false, message: "Transaction not found" });
-    }
+    if (!tx) { log.error(`Transaction not found: ${transactionReference}`); return res.status(404).json({ success: false, message: "Transaction not found" }); }
 
-    log.info(`Found TX in DB — status: ${c.bold}${tx.status}${c.reset} | DB ID: ${tx._id}`);
+    log.info(`Found TX — status: ${c.bold}${tx.status}${c.reset}`);
 
     if (tx.status === "confirmed" || tx.status === "processing") {
-      log.warn(`Already processed (status: ${tx.status}) — idempotent response`);
+      log.warn(`Already processed (status: ${tx.status})`);
       return res.json({ success: true, message: "Already processed" });
     }
     if (tx.status !== "pending") {
-      log.warn(`Unexpected status "${tx.status}" — cannot confirm`);
+      log.warn(`Unexpected status "${tx.status}"`);
       return res.status(400).json({ success: false, message: `Cannot confirm — status is ${tx.status}` });
     }
 
-    // Verify amount
     const tolerance = tx.tokenAmount * 0.001;
     const diff      = Math.abs(parseFloat(tokenAmount) - tx.tokenAmount);
     if (diff > tolerance) {
-      log.warn(`Amount mismatch — expected ${tx.tokenAmount}, got ${tokenAmount} (diff: ${diff})`);
+      log.warn(`Amount mismatch — expected ${tx.tokenAmount}, got ${tokenAmount}`);
     } else {
       log.success(`Amount verified — expected ${tx.tokenAmount}, got ${tokenAmount}`);
     }
 
-    // Update DB
     tx.status = "processing";
     tx.txId   = stacksTxId;
     tx.meta   = { ...tx.meta, stacksTxId, tokenReceivedAt: new Date().toISOString() };
     await tx.save();
     log.success(`DB updated to "processing"`);
-
-    log.info(`Initiating Lenco NGN payout → ${tx.meta.accountName} (${tx.meta.bankName})`);
-    log.info(`  Amount: ${c.green}₦${tx.ngnAmount.toLocaleString()}${c.reset}`);
 
     let lencoResult;
     try {
@@ -724,28 +855,15 @@ async function confirmTokenReceipt(req, res) {
       log.success(`DB updated to "settling" — Lenco transfer ID: ${lencoResult.transferId}`);
     } catch (lencoErr) {
       log.error(`Lenco transfer failed: ${lencoErr.message}`);
-      log.error("CRITICAL: Tokens received but NGN not sent — MANUAL ACTION REQUIRED");
-      box([
-        `${c.red}${c.bold}MANUAL PAYOUT REQUIRED${c.reset}`,
-        `${c.bold}Stacks TX :${c.reset} ${stacksTxId}`,
-        `${c.bold}NGN       :${c.reset} ₦${tx.ngnAmount}`,
-        `${c.bold}Account   :${c.reset} ${tx.meta.accountNumber} (${tx.meta.bankName})`,
-        `${c.bold}Name      :${c.reset} ${tx.meta.accountName}`,
-      ]);
       tx.status = "failed";
       tx.meta   = { ...tx.meta, failureReason: `Lenco failed: ${lencoErr.message}`, requiresManualSettlement: true };
       await tx.save();
       return res.status(500).json({ success: false, message: "NGN settlement failed. Support notified." });
     }
 
-    res.json({
-      success: true,
-      message: "Tokens received. NGN settlement initiated.",
-      data: { transactionReference, stacksTxId, tokenAmount: tx.tokenAmount, ngnAmount: tx.ngnAmount, lencoTransferId: lencoResult.transferId, estimatedSettlement: "5-15 minutes" },
-    });
+    res.json({ success: true, message: "Tokens received. NGN settlement initiated.", data: { transactionReference, stacksTxId, tokenAmount: tx.tokenAmount, ngnAmount: tx.ngnAmount, lencoTransferId: lencoResult.transferId, estimatedSettlement: "30-60 seconds" } });
   } catch (err) {
     log.error(`confirmTokenReceipt error: ${err.message}`);
-    log.error(err.stack);
     res.status(500).json({ success: false, message: err.message });
   }
 }
@@ -760,48 +878,34 @@ async function handleLencoWebhook(req, res) {
   llog.info(`Event: ${c.bold}${payload?.event}${c.reset} | Reference: ${payload?.data?.reference}`);
   llog.data("Full webhook payload", payload);
 
-  if (!signature) {
-    llog.error("Missing x-lenco-signature header — rejecting");
-    return res.status(401).json({ success: false, message: "Missing signature" });
-  }
-
-  if (!verifyLencoSignature(payload, signature)) {
-    llog.error("Invalid signature — rejecting webhook");
-    return res.status(401).json({ success: false, message: "Invalid signature" });
-  }
+  if (!signature) { llog.error("Missing x-lenco-signature header"); return res.status(401).json({ success: false, message: "Missing signature" }); }
+  if (!verifyLencoSignature(payload, signature)) { llog.error("Invalid signature"); return res.status(401).json({ success: false, message: "Invalid signature" }); }
 
   llog.success("Signature verified");
 
   const { event, data } = payload;
 
   if (event === "transfer.completed") {
-    llog.info(`Processing transfer.completed for ${data?.reference}`);
     const tx = await Transaction.findOne({ paymentReference: data.reference, direction: "offramp" });
-    if (!tx) {
-      llog.warn(`No TX found for reference ${data.reference} — possibly already cleaned up`);
-      return res.json({ success: true, message: "Webhook received" });
-    }
-    llog.info(`Found TX — current status: ${tx.status}`);
-    if (tx.status === "confirmed") {
-      llog.info("Already confirmed — idempotent");
-      return res.json({ success: true, message: "Already confirmed" });
-    }
+    if (!tx) { llog.warn(`No TX found for reference ${data.reference}`); return res.json({ success: true, message: "Webhook received" }); }
+    if (tx.status === "confirmed") { llog.info("Already confirmed"); return res.json({ success: true, message: "Already confirmed" }); }
     tx.status      = "confirmed";
     tx.confirmedAt = new Date();
     tx.meta        = { ...tx.meta, lencoStatus: "completed", lencoSettledAt: new Date().toISOString() };
     await tx.save();
     llog.success(`✅ OFFRAMP COMPLETE — ${tx.tokenAmount} ${tx.token} → ₦${tx.ngnAmount} → ${tx.meta.accountName}`);
+    // Refresh balance cache after confirmed payout
+    getLencoAccountBalance(true).catch(() => {});
     return res.json({ success: true, message: "Transaction confirmed" });
   }
 
   if (event === "transfer.failed" || event === "transfer.reversed") {
-    llog.error(`Transfer FAILED/REVERSED for ${data?.reference}: ${data?.reason || event}`);
+    llog.error(`Transfer FAILED/REVERSED for ${data?.reference}`);
     const tx = await Transaction.findOne({ paymentReference: data.reference, direction: "offramp" });
     if (tx) {
       tx.status = "failed";
       tx.meta   = { ...tx.meta, lencoStatus: "failed", failureReason: data.reason || `Lenco event: ${event}`, requiresManualSettlement: true };
       await tx.save();
-      llog.error(`MANUAL REFUND REQUIRED: ${tx.tokenAmount} ${tx.token} → ${tx.senderAddress}`);
     }
     return res.json({ success: true, message: "Failure recorded" });
   }
@@ -814,8 +918,7 @@ async function getOfframpStatus(req, res) {
   log.info(`GET /status/${req.params.reference}`);
   try {
     const tx = await Transaction.findOne({ paymentReference: req.params.reference, direction: "offramp" }).lean();
-    if (!tx) { log.warn("Transaction not found"); return res.status(404).json({ success: false, message: "Transaction not found" }); }
-    log.info(`Found — status: ${c.bold}${tx.status}${c.reset}`);
+    if (!tx) return res.status(404).json({ success: false, message: "Transaction not found" });
     const statusMessages = { pending: "Awaiting token deposit", processing: "Tokens received. Initiating NGN transfer.", settling: "NGN bank transfer in progress", confirmed: "NGN successfully sent to your bank account", failed: "Transaction failed" };
     res.json({ success: true, data: { transactionId: tx._id, transactionReference: tx.paymentReference, token: tx.token, tokenAmount: tx.tokenAmount, ngnAmount: tx.ngnAmount, status: tx.status, statusMessage: statusMessages[tx.status] || tx.status, stacksTxId: tx.txId, lencoTransferId: tx.meta?.lencoTransferId, bank: { accountName: tx.meta?.accountName, accountNumber: tx.meta?.accountNumber, bankName: tx.meta?.bankName }, createdAt: tx.createdAt, confirmedAt: tx.confirmedAt, failureReason: tx.status === "failed" ? tx.meta?.failureReason : undefined } });
   } catch (err) {
@@ -844,4 +947,16 @@ async function getOfframpHistory(req, res) {
   }
 }
 
-module.exports = { getBankList, getOfframpRate, verifyAccount, initializeOfframp, notifyTxBroadcast, confirmTokenReceipt, handleLencoWebhook, getOfframpStatus, getOfframpHistory };
+module.exports = {
+  getBankList,
+  getOfframpRate,
+  verifyAccount,
+  initializeOfframp,
+  notifyTxBroadcast,
+  confirmTokenReceipt,
+  handleLencoWebhook,
+  getOfframpStatus,
+  getOfframpHistory,
+  getLiquidityInfo,       // ← new: expose to router as GET /api/offramp/liquidity
+  getLencoAccountBalance, // ← new: export for health checks / admin tooling
+};
