@@ -59,9 +59,11 @@ const transactionSchema = new mongoose.Schema(
     },
 
     // Status lifecycle
+    // pending → processing → settling → confirmed
+    //                      ↘ failed
     status: {
       type: String,
-      enum: ["pending", "processing", "confirmed", "failed"],
+      enum: ["pending", "processing", "settling", "confirmed", "failed"], // ✅ added "settling"
       default: "pending",
     },
 

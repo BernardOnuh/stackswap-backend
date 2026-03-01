@@ -57,14 +57,15 @@ async function calculateOfframpQuote(token, tokenAmount) {
 
   const marketRateNGN = tokenData.priceNGN;
   const grossNGN      = tokenAmount * marketRateNGN;
-  const ngnAmount     = grossNGN - OFFRAMP_FLAT_FEE_NGN;
+  // ✅ FIX: floor to whole NGN — Lenco requires integer amounts
+  const ngnAmount     = Math.floor(grossNGN - OFFRAMP_FLAT_FEE_NGN);
 
   const quote = {
     token:         token.toUpperCase(),
     marketRateNGN: parseFloat(marketRateNGN.toFixed(2)),
     flatFeeNGN:    OFFRAMP_FLAT_FEE_NGN,
     grossNGN:      parseFloat(grossNGN.toFixed(2)),
-    ngnAmount:     parseFloat(ngnAmount.toFixed(2)),
+    ngnAmount,   // already a whole number
     tokenAmount:   parseFloat(tokenAmount.toFixed(6)),
     priceUSD:      tokenData.priceUSD,
     usdToNgn:      tokenData.usdToNgn,
@@ -135,14 +136,15 @@ async function initiateLencoTransfer(amountNGN, accountNumber, bankCode, account
   ]);
 
   if (!debitAccountId) throw new Error("LENCO_ACCOUNT_ID not configured — needed to debit your Lenco account");
+
+  // ✅ FIX: use "accountId" (not "debitAccountId"), amount as string, remove accountName
   const payload = {
-    amount:      amountNGN,
+    accountId:    debitAccountId,
+    amount:       String(amountNGN),  // whole number string e.g. "249"
     accountNumber,
     bankCode,
-    accountName,
-    debitAccountId,
-    reference,        // ← change "clientReference: reference" to just "reference"
-    narration:   `StackSwap offramp - ${reference}`,
+    narration:    `StackSwap offramp - ${reference}`,
+    reference,
   };
 
   llog.data("Lenco transfer request body", payload);
