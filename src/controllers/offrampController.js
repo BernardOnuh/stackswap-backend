@@ -98,13 +98,13 @@ async function getLencoAccountBalance(forceRefresh = false) {
     // Dedicated balance endpoint returns:
     // { status: true, data: { balance: number, ledgerBalance: number } }
     // Balance is in KOBO — divide by 100 to get NGN
-    const balanceRaw = res.data?.data?.balance ?? res.data?.data?.availableBalance ?? 0;
-    const balanceNGN = balanceRaw / 100; // kobo → NGN
+    const balanceRaw = res.data?.data?.availableBalance ?? res.data?.data?.currentBalance ?? res.data?.data?.balance ?? "0";
+    const balanceNGN = parseFloat(String(balanceRaw)); // already NGN — just parse
 
     lencoBalanceCache    = balanceNGN;
     lencoBalanceCachedAt = now;
 
-    llog.success(`Lenco balance: ₦${balanceNGN.toLocaleString()} (raw: ${balanceRaw} kobo)`);
+    llog.success(`Lenco balance: ₦${balanceNGN.toLocaleString()} (raw string: "${balanceRaw}" NGN)`);
     return balanceNGN;
 
   } catch (err) {
@@ -399,36 +399,43 @@ async function verifyAccount(req, res) {
 // Does NOT expose the raw balance — returns a sanitised "maxOrderNGN" instead.
 
 async function getLiquidityInfo(req, res) {
-  log.info("GET /liquidity — checking platform liquidity");
   try {
-    const balanceNGN = await getLencoAccountBalance(true); // force refresh
+    llog.info("GET /liquidity — checking platform liquidity");
+
+    // Force-refresh balance (bypass 30s cache for accurate check)
+    const balanceNGN = await getLencoAccountBalance(true);
 
     if (balanceNGN === null) {
+      llog.warn("Could not fetch Lenco balance — liquidity check unavailable");
       return res.status(503).json({
         success: false,
-        message: "Liquidity check temporarily unavailable",
-        available: false,
+        message: "Liquidity check temporarily unavailable. Please try again.",
       });
     }
 
-    // Max single order = balance minus the safety buffer
-    const maxOrderNGN = Math.max(0, Math.floor(balanceNGN - LENCO_MIN_BALANCE_NGN));
-    const available   = maxOrderNGN > 0;
+    const LENCO_MIN_BALANCE_NGN = parseFloat(process.env.LENCO_MIN_BALANCE_NGN ?? "0");
+    const maxOrderNGN  = Math.max(0, Math.floor(balanceNGN - LENCO_MIN_BALANCE_NGN));
+    const available    = balanceNGN > 0 && maxOrderNGN > 0;
 
-    log.info(`Liquidity: balance=₦${balanceNGN.toLocaleString()} maxOrder=₦${maxOrderNGN.toLocaleString()} available=${available}`);
+    llog.info(`Liquidity: balance=₦${balanceNGN} maxOrder=₦${maxOrderNGN} available=${available}`);
 
-    res.json({
+    return res.json({
       success: true,
       data: {
-        available,          // bool — true if any orders can be processed
-        maxOrderNGN,        // max NGN value of a single order we can fulfil right now
+        balanceNGN,          // ← raw balance for direct frontend comparison
+        maxOrderNGN,         // ← balance minus safety buffer
+        available,
         minBufferNGN: LENCO_MIN_BALANCE_NGN,
         checkedAt: new Date().toISOString(),
       },
     });
+
   } catch (err) {
-    log.error(`getLiquidityInfo error: ${err.message}`);
-    res.status(500).json({ success: false, message: err.message });
+    llog.error(`getLiquidityInfo error: ${err.message}`);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error during liquidity check.",
+    });
   }
 }
 
