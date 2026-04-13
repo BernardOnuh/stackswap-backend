@@ -6,7 +6,7 @@ const options = {
     info: {
       title: "StackSwap API",
       version: "1.0.0",
-      description: "🟠 STX & USDC ↔ NGN onramp/offramp API — powered by Stacks blockchain",
+      description: "STX & USDC ↔ NGN onramp/offramp API — powered by Stacks blockchain",
       contact: {
         name: "StackSwap",
       },
@@ -27,7 +27,7 @@ const options = {
         Price: {
           type: "object",
           properties: {
-            priceNGN: { type: "number", example: 1847.35 },
+            priceNGN: { type: "number", example: 1320.35 },
             priceUSD: { type: "number", example: 1.14 },
             change24h: { type: "number", example: 2.4 },
           },
