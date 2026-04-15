@@ -25,5 +25,4 @@ function errorHandler(err, req, res, next) {
     message: process.env.NODE_ENV === "production" ? "Internal server error" : err.message,
   });
 }
-
 module.exports = { notFound, errorHandler };

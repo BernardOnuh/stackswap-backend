@@ -56,7 +56,6 @@ function makeLogger(tag, tagColor) {
     box,
   };
 }
-
 module.exports = {
   // One logger per module
   offramp:  makeLogger("Offramp",  c.orange),
